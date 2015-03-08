@@ -1,7 +1,6 @@
 const Applet = imports.ui.applet;
 const Clutter = imports.gi.Clutter;
 const GLib = imports.gi.GLib;
-const GnomeBluetoothApplet = imports.gi.GnomeBluetoothApplet;
 const GnomeBluetooth = imports.gi.GnomeBluetooth;
 const Lang = imports.lang;
 const St = imports.gi.St;
@@ -9,6 +8,7 @@ var ABI=6;
 const Main = imports.ui.main;
 const MessageTray = imports.ui.messageTray;
 const PopupMenu = imports.ui.popupMenu;
+const Gio = imports.gi.Gio;
 
 const ConnectionState = {
     DISCONNECTED: 0,
@@ -16,6 +16,18 @@ const ConnectionState = {
     DISCONNECTING: 2,
     CONNECTING: 3
 }
+
+const BUS_NAME = 'org.cinnamon.SettingsDaemon.Rfkill';
+const OBJECT_PATH = '/org/cinnamon/SettingsDaemon/Rfkill';
+
+const RfkillManagerInterface = '<node> \
+<interface name="org.cinnamon.SettingsDaemon.Rfkill"> \
+<property name="BluetoothAirplaneMode" type="b" access="readwrite" /> \
+<property name="BluetoothHasAirplaneMode" type="b" access="read" /> \
+</interface> \
+</node>';
+
+const RfkillManagerProxy = Gio.DBusProxy.makeProxyWrapper(RfkillManagerInterface);
 
  if (!GnomeBluetooth.hasOwnProperty('KillswitchState')){
      ABI=4;
@@ -212,44 +224,23 @@ MyApplet.prototype = {
             
             this.set_applet_icon_symbolic_name('bluetooth-disabled');
             this.set_applet_tooltip(_("Bluetooth"));
-                        
-            GLib.spawn_command_line_sync ('pkill -f "^bluetooth-applet$"');
-            this._applet = new GnomeBluetoothApplet.Applet();
+
+            this._proxy = new RfkillManagerProxy(Gio.DBus.session, BUS_NAME, OBJECT_PATH,
+                                                 Lang.bind(this, function(proxy, error) {
+                                                     if (error) {
+                                                         log(error.message);
+                                                         return;
+                                                     }
+                                                     this.setup_rfkill();
+                                                 }));
+            this._proxy.connect('g-properties-changed', Lang.bind(this, this._updateKillswitch));
+
             this._killswitch = new PopupMenu.PopupSwitchMenuItem(_("Bluetooth"), false);
-            this._applet.connect('notify::killswitch-state', Lang.bind(this, this._updateKillswitch));
-            this._killswitch.connect('toggled', Lang.bind(this, function() {
-                let current_state = this._applet.killswitch_state;
-		if (ABI==6){
-			if (current_state != GnomeBluetooth.KillswitchState.HARD_BLOCKED &&
-			    current_state != GnomeBluetooth.KillswitchState.NO_ADAPTER) {
-			    this._applet.killswitch_state = this._killswitch.state ?
-				GnomeBluetooth.KillswitchState.UNBLOCKED:
-			        GnomeBluetooth.KillswitchState.SOFT_BLOCKED;
-			} else
-				this._killswitch.setToggleState(false);
-		} else {
-			if (current_state != GnomeBluetoothApplet.KillswitchState.HARD_BLOCKED &&
-			    current_state != GnomeBluetoothApplet.KillswitchState.NO_ADAPTER) {
-			    this._applet.killswitch_state = this._killswitch.state ?
-				GnomeBluetoothApplet.KillswitchState.UNBLOCKED:
-			        GnomeBluetoothApplet.KillswitchState.SOFT_BLOCKED;
-			} else
-				this._killswitch.setToggleState(false);
-		}
-		global.logError(this._killswitch.state)
-            }));
-
-            this._discoverable = new PopupMenu.PopupSwitchMenuItem(_("Visibility"), this._applet.discoverable);
-            this._applet.connect('notify::discoverable', Lang.bind(this, function() {
-                this._discoverable.setToggleState(this._applet.discoverable);
-            }));
-            this._discoverable.connect('toggled', Lang.bind(this, function() {
-                this._applet.discoverable = this._discoverable.state;
-            }));
-
-            this._updateKillswitch();
             this.menu.addMenuItem(this._killswitch);
+
+            this._discoverable = new PopupMenu.PopupSwitchMenuItem(_("Visibility"), false);
             this.menu.addMenuItem(this._discoverable);
+
             this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
             this._fullMenuItems = [new PopupMenu.PopupSeparatorMenuItem(),
@@ -270,25 +261,54 @@ MyApplet.prototype = {
                 this.menu.addMenuItem(item);
             }
 
+            this._client = new GnomeBluetooth.Client();
+            this._model = this._client.get_model();
+            this._model.connect('row-changed', Lang.bind(this, this._updateDevices));
+            this._model.connect('row-deleted', Lang.bind(this, this._updateDevices));
+            this._model.connect('row-inserted', Lang.bind(this, this._updateDevices));
+log(this._model.length + "  ITEM IN MODEL");
             this._deviceItemPosition = 3;
             this._deviceItems = [];
-            this._applet.connect('devices-changed', Lang.bind(this, this._updateDevices));
-            this._updateDevices();
 
-            this._applet.connect('notify::show-full-menu', Lang.bind(this, this._updateFullMenu));
+
+
+
+            // this._applet.connect('notify::show-full-menu', Lang.bind(this, this._updateFullMenu));
             this._updateFullMenu();
 
             this.menu.addSettingsAction(_("Bluetooth Settings"), 'bluetooth'); 
 
-            this._applet.connect('pincode-request', Lang.bind(this, this._pinRequest));
-            this._applet.connect('confirm-request', Lang.bind(this, this._confirmRequest));
-            this._applet.connect('auth-request', Lang.bind(this, this._authRequest));
-            this._applet.connect('cancel-request', Lang.bind(this, this._cancelRequest));     
-                      
+            // this._applet.connect('pincode-request', Lang.bind(this, this._pinRequest));
+            // this._applet.connect('confirm-request', Lang.bind(this, this._confirmRequest));
+            // this._applet.connect('auth-request', Lang.bind(this, this._authRequest));
+            // this._applet.connect('cancel-request', Lang.bind(this, this._cancelRequest));     
+            this._updateDevices();
         }
         catch (e) {
             global.logError(e);
         }
+    },
+
+    setup_rfkill: function() {
+        this._killswitch.connect('toggled', Lang.bind(this, function() {
+            let killed = this._proxy.BluetoothAirplaneMode;
+            let has_kill = this._proxy.BluetoothHasAirplaneMode;
+            if (has_kill) {
+                this._proxy.BluetoothAirplaneMode = !killed;
+            } else
+                this._killswitch.setToggleState(false);
+        }));
+
+
+        this._client.connect('notify::default-adapter-discoverable', Lang.bind(this, function() {
+            this._discoverable.setToggleState(this._client.default_adapter_discoverable);
+        }));
+        this._discoverable.connect('toggled', Lang.bind(this, function() {
+            this._client.default_adapter_discoverable = this._discoverable.state;
+        }));
+
+        this._updateKillswitch();
+        // this._updateDevices();
     },
     
     on_applet_clicked: function(event) {
@@ -297,22 +317,18 @@ MyApplet.prototype = {
     
    
     _updateKillswitch: function() {
-        let current_state = this._applet.killswitch_state;
-	let on;
-	let has_adapter;
-	let can_toggle;
-	if (ABI==6){
-		on = current_state == GnomeBluetooth.KillswitchState.UNBLOCKED;
-		has_adapter = current_state != GnomeBluetooth.KillswitchState.NO_ADAPTER;
-		can_toggle = current_state != GnomeBluetooth.KillswitchState.NO_ADAPTER &&
-			         current_state != GnomeBluetooth.KillswitchState.HARD_BLOCKED;
-	} else {
-		on = current_state == GnomeBluetoothApplet.KillswitchState.UNBLOCKED;
-		has_adapter = current_state != GnomeBluetoothApplet.KillswitchState.NO_ADAPTER;
-		can_toggle = current_state != GnomeBluetoothApplet.KillswitchState.NO_ADAPTER &&
-			         current_state != GnomeBluetoothApplet.KillswitchState.HARD_BLOCKED;
-	}
-        this._killswitch.setToggleState(on);
+        let current_state = this._proxy.BluetoothHasAirplaneMode && this._proxy.BluetoothAirplaneMode;
+        let on = !this._proxy.BluetoothAirplaneMode;
+        let has_adapter = true;
+        let can_toggle = true;
+        // on = current_state == GnomeBluetooth.KillswitchState.UNBLOCKED;
+		// has_adapter = current_state != GnomeBluetooth.KillswitchState.NO_ADAPTER;
+		// can_toggle = current_state != GnomeBluetooth.KillswitchState.NO_ADAPTER &&
+			         // current_state != GnomeBluetooth.KillswitchState.HARD_BLOCKED;
+
+
+// FIXME: need to get adapter status
+        this._killswitch.setToggleState(current_state);
         if (can_toggle)
             this._killswitch.setStatus(null);
         else
@@ -334,32 +350,43 @@ MyApplet.prototype = {
     },
 
     _updateDevices: function() {
-        let devices = this._applet.get_devices();
-
-        let newlist = [ ];
-        for (let i = 0; i < this._deviceItems.length; i++) {
-            let item = this._deviceItems[i];
+        let newlist = [];
+        let [ret, iter] = this._model.get_iter_first();
+        while (ret) {
+            let device = this._model.get_value(iter,
+                                               GnomeBluetooth.Column.PROXY);
+log(device + " first iter_________________");
             let destroy = true;
-            for (let j = 0; j < devices.length; j++) {
-                if (item._device.device_path == devices[j].device_path) {
-                    this._updateDeviceItem(item, devices[j]);
+            let i = 0;
+
+            for (i = 0; i < this._deviceItems.length; i++) {
+                if (device.Address == this._deviceItems[i].Address) {
+                    this._updateDeviceItem(this._deviceItems[i], device);
                     destroy = false;
                     break;
                 }
             }
-            if (destroy)
-                item.destroy();
+
+            if (destroy && this._deviceItems.length > 0)
+                this._deviceItems[i].destroy();
             else
-                newlist.push(item);
+                newlist.push(device);
+
+            ret = this._model.iter_next(iter);
         }
 
         this._deviceItems = newlist;
         this._hasDevices = newlist.length > 0;
-        for (let i = 0; i < devices.length; i++) {
-            let d = devices[i];
-            if (d._item)
+
+
+        [ret, iter] = this._model.get_iter_first();
+        while (ret) {
+            let device = this._model.get_value(iter,
+                                               GnomeBluetooth.Column.PROXY);
+log(device);
+            if (device._item)
                 continue;
-            let item = this._createDeviceItem(d);
+            let item = this._createDeviceItem(device);
             if (item) {
                 this.menu.addMenuItem(item, this._deviceItemPosition + this._deviceItems.length);
                 this._deviceItems.push(item);
@@ -369,45 +396,28 @@ MyApplet.prototype = {
     },
 
     _updateDeviceItem: function(item, device) {
-        if (!device.can_connect && device.capabilities == GnomeBluetoothApplet.Capabilities.NONE) {
-            item.destroy();
-            return;
-        }
-
-        let prevDevice = item._device;
-        let prevCapabilities = prevDevice.capabilities;
-        let prevCanConnect = prevDevice.can_connect;
-
         // adopt the new device object
         item._device = device;
-        item._connected = device.connected
+        item._connected = device.Connected;
         device._item = item;
 
         // update properties
-        item.label.text = device.alias;
+        item.label.text = device.Alias;
 
-        if (prevCapabilities != device.capabilities ||
-            prevCanConnect != device.can_connect) {
-            // need to rebuild the submenu
-            item.menu.removeAll();
-            this._buildDeviceSubMenu(item, device);
-        }
+        // this._buildDeviceSubMenu(item, device);
 
         // update connected property
-        if (device.can_connect)
-            item._connectedMenuitem.setToggleState(device.connected);
+        item._connectedMenuitem.setToggleState(device.Connected);
     },
 
     _createDeviceItem: function(device) {
-        if (!device.can_connect && device.capabilities == GnomeBluetoothApplet.Capabilities.NONE)
-            return null;
-        let item = new PopupMenu.PopupSubMenuMenuItem(device.alias);
+        let item = new PopupMenu.PopupSubMenuMenuItem(device.Alias);
 
         // adopt the device object, and add a back link
         item._device = device;
         device._item = item;
 
-        this._buildDeviceSubMenu(item, device);
+        // this._buildDeviceSubMenu(item, device);
 
         return item;
     },
@@ -495,14 +505,14 @@ MyApplet.prototype = {
     },
 
     _updateFullMenu: function() {
-        if (this._applet.show_full_menu) {
-            this._showAll(this._fullMenuItems);
-            if (this._hasDevices)
-                this._showAll(this._deviceItems);
-        } else {
-            this._hideAll(this._fullMenuItems);
-            this._hideAll(this._deviceItems);
-        }
+        // if (this._applet.show_full_menu) {
+        //     this._showAll(this._fullMenuItems);
+        //     if (this._hasDevices)
+        //         this._showAll(this._deviceItems);
+        // } else {
+        //     this._hideAll(this._fullMenuItems);
+        //     this._hideAll(this._deviceItems);
+        // }
     },
 
     _showAll: function(items) {
