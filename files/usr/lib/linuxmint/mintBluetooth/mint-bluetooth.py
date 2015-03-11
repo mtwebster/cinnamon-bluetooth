@@ -94,8 +94,13 @@ class BluetoothConfig:
             finish_state = False;
 
         # figure out if it worked...
+        #
+        #
 
+        # commit the state (background of switch now changes)
         self.rf_switch.set_state(finish_state)
+
+        # stop handler
         return True
 
 if __name__ == "__main__":
